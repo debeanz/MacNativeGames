@@ -1,0 +1,217 @@
+# Builds the unsigned iPhone/iPad IPA of Tears of the Kingdom on a GitHub-hosted Mac, from your own game files.
+# Setup and usage: .github/BUILD-IPA.md
+#
+# The game files come from your own cloud storage through rclone (or a direct https:// link), and the finished IPA goes
+# back there. Nothing from the game is stored on GitHub: no artifacts, and no game data or key values in the log.
+
+name: Build iPhone IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      game:
+        description: 'Base game 1.0.0, XCI or NSP: rclone path such as "drive:Switch/totk.xci", or a direct https:// link'
+        required: false
+      update:
+        description: 'Update NSP or NSZ (1.4.3 is the version tested on iPhone); leave empty to build 1.0.0'
+        required: false
+      fonts:
+        description: 'NSP base game only: rclone folder of an unpacked firmware (.nca files) or of the six shared-font .bfttf files'
+        required: false
+      output:
+        description: 'rclone folder the IPA is uploaded to, such as "drive:Switch/ipa"'
+        required: false
+      source_ref:
+        description: 'Branch, tag or commit of ly05010419/MacNativeGames to build'
+        required: false
+        default: main
+      runner:
+        description: 'macos-26 is free on a public repository; macos-26-xlarge is faster but billed'
+        type: choice
+        options: [macos-26, macos-26-xlarge]
+        default: macos-26
+      dry_run:
+        description: 'Only prepare the Mac and check disk space and inputs; download and build nothing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ipa:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      HOMEBREW_NO_ENV_HINTS: '1'
+      # Inputs reach the scripts as environment variables, never pasted into them
+      IN_GAME: ${{ inputs.game }}
+      IN_UPDATE: ${{ inputs.update }}
+      IN_FONTS: ${{ inputs.fonts }}
+      IN_OUTPUT: ${{ inputs.output }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ly05010419/MacNativeGames
+          ref: ${{ inputs.source_ref }}
+          path: src
+          persist-credentials: false
+
+      - name: Check inputs and secrets
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          echo "TOTK=$HOME/totk" >> "$GITHUB_ENV"
+          remote() { [ -n "$1" ] && case "$1" in http://*|https://*) false ;; *) true ;; esac; }
+          if [ "$DRY_RUN" != true ]; then
+            [ -n "$IN_GAME" ] || { echo "::error::the game input is empty"; exit 1; }
+            [ -n "$IN_OUTPUT" ] || { echo "::error::the output input is empty"; exit 1; }
+            [ -n "$PROD_KEYS" ] || { echo "::error::the PROD_KEYS secret is not set (Settings > Secrets and variables > Actions)"; exit 1; }
+          fi
+          if remote "$IN_GAME" || remote "$IN_UPDATE" || remote "$IN_FONTS" || remote "$IN_OUTPUT"; then
+            [ -n "$RCLONE_CONF" ] || { echo "::error::an rclone path is used but the RCLONE_CONF secret is not set"; exit 1; }
+          fi
+          if [ -n "$RCLONE_CONF" ]; then
+            install -m 600 /dev/null "$RUNNER_TEMP/rclone.conf"
+            printf '%s\n' "$RCLONE_CONF" > "$RUNNER_TEMP/rclone.conf"
+            echo "RCLONE_CONFIG=$RUNNER_TEMP/rclone.conf" >> "$GITHUB_ENV"
+          fi
+
+      - name: Free disk space
+        run: |
+          df -h /System/Volumes/Data
+          # Keep only the selected Xcode; the others, the simulators and unused SDKs take most of the disk
+          keep="$(cd "$(xcode-select -p)/../.." && pwd -P)"
+          echo "keeping $keep ($(xcodebuild -version | head -1))"
+          for x in /Applications/Xcode*.app; do
+            [ -L "$x" ] && continue
+            [ "$(cd "$x" && pwd -P)" = "$keep" ] && continue
+            sudo rm -rf "$x" &
+          done
+          xcrun simctl shutdown all >/dev/null 2>&1 || true
+          xcrun simctl delete all >/dev/null 2>&1 || true
+          xcrun simctl runtime delete all </dev/null >/dev/null 2>&1 || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator ~/Library/Android "${ANDROID_HOME:-/nonexistent}" ~/.dotnet \
+            /usr/local/share/dotnet ~/.ghcup ~/.rustup ~/.cargo "${RUNNER_TOOL_CACHE:-/nonexistent}" &
+          wait
+          df -h /System/Volumes/Data
+
+      - name: Install build tools
+        run: |
+          brew install opus libvpx python@3.14 xcodegen cmake ninja rclone
+          # Xcode 26 ships the Metal compiler as a separate component; the iOS build compiles its startup shaders with it
+          if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk iphoneos metal --version | head -1
+          xcrun --sdk iphoneos --show-sdk-version
+          python3.14 --version
+
+      - name: Check disk space for the build
+        run: |
+          size_gb() {   # size of an input in GB, rounded up; 0 when empty
+            case "$1" in
+              '') echo 0 ;;
+              http://*|https://*) b=$(curl -fsSLI "$1" | tr -d '\r' | awk 'tolower($1)=="content-length:"{n=$2} END{print n+0}'); echo $(( (b + 2**30 - 1) / 2**30 )) ;;
+              *) b=$(rclone size --json "$1" | python3.14 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])'); echo $(( (b + 2**30 - 1) / 2**30 )) ;;
+            esac
+          }
+          inputs=0
+          for src in "$IN_GAME" "$IN_UPDATE" "$IN_FONTS"; do
+            [ -n "$src" ] || continue
+            gb=$(size_gb "$src")
+            echo "input $src: $gb GB"
+            inputs=$((inputs + gb))
+          done
+          [ -n "$IN_GAME" ] || { inputs=25; echo "no game input given: assuming 25 GB of inputs"; }
+          # build_app.py asks for 60 GB free beside a fresh base + update build (45 GB without an update)
+          build=$([ -n "$IN_UPDATE" ] || [ -z "$IN_GAME" ] && echo 60 || echo 45)
+          free=$(df -g "$HOME" | awk 'NR==2{print $4}')
+          need=$((inputs + build + 2))
+          echo "free: $free GB, needed: about $need GB ($inputs GB of inputs + $build GB for the build)"
+          if [ "$free" -lt "$need" ]; then
+            echo "::error::not enough disk space on this runner ($free GB free, about $need GB needed); try the macos-26-xlarge runner"
+            exit 1
+          fi
+
+      - name: Download the game files
+        if: inputs.dry_run != true
+        run: |
+          mkdir -p "$TOTK/in" "$TOTK/fonts" "$TOTK/out"
+          fetch() {   # fetch <source> <folder>: prints the downloaded file's path
+            local name
+            case "$1" in
+              http://*|https://*)
+                name="${1%%\?*}"; name="${name##*/}"
+                curl -fL --retry 5 --no-progress-meter -o "$2/${name:-download}" "$1" >&2
+                ;;
+              *)
+                name="${1##*/}"; name="${name#*:}"
+                rclone copy "$1" "$2" --multi-thread-streams 8 --stats 1m --stats-one-line --stats-log-level NOTICE >&2
+                ;;
+            esac
+            echo "$2/$name"
+          }
+          game=$(fetch "$IN_GAME" "$TOTK/in")
+          echo "GAME_FILE=$game" >> "$GITHUB_ENV"
+          if [ -n "$IN_UPDATE" ]; then
+            update=$(fetch "$IN_UPDATE" "$TOTK/in")
+            echo "UPDATE_FILE=$update" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$IN_FONTS" ]; then
+            rclone copy "$IN_FONTS" "$TOTK/fonts" --stats 1m --stats-one-line --stats-log-level NOTICE
+          fi
+          ls -l "$TOTK/in" "$TOTK/fonts"
+          df -h /System/Volumes/Data
+
+      - name: Build the IPA
+        if: inputs.dry_run != true
+        working-directory: src
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          keys="$RUNNER_TEMP/prod.keys"
+          install -m 600 /dev/null "$keys"
+          printf '%s\n' "$PROD_KEYS" > "$keys"
+          trap 'rm -f "$keys"' EXIT
+          args=("$GAME_FILE" -k "$keys" --platform ios -o "$TOTK/out/TOTK.ipa" --work "$TOTK/TOTK_build" --no-shader-reminder)
+          [ -z "${UPDATE_FILE:-}" ] || args+=(--update "$UPDATE_FILE")
+          if compgen -G "$TOTK/fonts/*.bfttf" >/dev/null; then
+            args+=(--shared-fonts "$TOTK/fonts")
+          elif compgen -G "$TOTK/fonts/*.nca" >/dev/null; then
+            args+=(--firmware "$TOTK/fonts")
+          fi
+          python3.14 -u build_app.py "${args[@]}"
+          ls -l "$TOTK/out"
+          shasum -a 256 "$TOTK/out/TOTK.ipa"
+
+      - name: Upload the IPA
+        if: inputs.dry_run != true
+        run: |
+          dest="${IN_OUTPUT%/}"
+          case "$dest" in *:) ;; *) dest="$dest/" ;; esac
+          name="TOTK-$(date -u +%Y%m%d)-run${GITHUB_RUN_NUMBER}.ipa"
+          rclone copyto "$TOTK/out/TOTK.ipa" "$dest$name" --stats 1m --stats-one-line --stats-log-level NOTICE
+          echo "uploaded $dest$name" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Build logs may hold what hactool prints about the encrypted game files, so they go to your own storage, not GitHub
+      - name: Upload build logs to your storage
+        if: failure() && inputs.dry_run != true && inputs.output != '' && env.RCLONE_CONFIG != ''
+        run: |
+          [ -d "$TOTK/TOTK_build/logs" ] || exit 0
+          dest="${IN_OUTPUT%/}"
+          case "$dest" in *:) ;; *) dest="$dest/" ;; esac
+          rclone copy "$TOTK/TOTK_build/logs" "${dest}logs-run${GITHUB_RUN_NUMBER}"
+          echo "build logs: ${dest}logs-run${GITHUB_RUN_NUMBER}" | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h /System/Volumes/Data
