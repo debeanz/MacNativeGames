@@ -4,11 +4,13 @@ Builds the Tears of the Kingdom IPA on GitHub Actions straight from the game fil
 
 .DESCRIPTION
 Shares the game file's folder through a temporary, password-protected Cloudflare quick tunnel (rclone serve webdav and
-cloudflared, no Cloudflare account needed), starts the "Build iPhone IPA" workflow on your fork, waits for it, and joins
-the IPA it sends back in 90 MB parts. The tunnel address and its password go to the RCLONE_CONF secret only.
+cloudflared, no Cloudflare account needed) and starts the "Build iPhone IPA" workflow on your fork. The runner downloads
+the game files through that tunnel; when the IPA is built, it opens a tunnel of its own and this script downloads the
+IPA through it (a Cloudflare tunnel takes at most 100 MB per upload, so the runner cannot simply send it back) and
+checks its SHA-256. Each tunnel's address and password go only to the RCLONE_CONF secret or to the other side.
 
 Keep the PC on and online until the script says the IPA is ready: the runner downloads the game files at the start and
-uploads the IPA at the end, hours later. The script keeps Windows from sleeping while it runs.
+the IPA comes back at the end, hours later. The script keeps Windows from sleeping while it runs.
 
 Needs rclone (winget install Rclone.Rclone), cloudflared (winget install Cloudflare.cloudflared) and the GitHub CLI,
 signed in (gh auth login). The update and the fonts folder must be in the game file's folder or a folder inside it.
@@ -18,7 +20,7 @@ signed in (gh auth login). The update and the fonts folder must be in the game f
 
 .EXAMPLE
 .\build-from-pc.ps1 -Game D:\Switch\totk.xci -Test
-Moves 200 MB each way through the tunnel in a few minutes, without building, and shows the speeds.
+Moves 200 MB each way through the tunnels in a few minutes, without building, and shows the speeds.
 #>
 param(
     [Parameter(Mandatory = $true)] [string] $Game,
@@ -30,7 +32,6 @@ param(
     [switch] $Test
 )
 $ErrorActionPreference = 'Stop'
-$OutputEncoding = New-Object System.Text.UTF8Encoding $false   # what PowerShell pipes into gh and rclone
 
 foreach ($tool in @(
         @('rclone', 'winget install Rclone.Rclone, then open a new PowerShell window'),
@@ -54,50 +55,49 @@ function RemotePath([string] $path) {
     }
     'pc:' + $full.Substring($prefix.Length).Replace('\', '/')
 }
-$fields = @('-f', "game=$(RemotePath $Game)", '-f', 'output=pc:ipa-parts', '-f', 'split_upload=true', '-f', "runner=$Runner")
+$fields = @('-f', "game=$(RemotePath $Game)", '-f', 'output=pc:from-runner', '-f', 'pull=true', '-f', "runner=$Runner")
 if ($Update) { $fields += @('-f', "update=$(RemotePath $Update)") }
 if ($Fonts) { $fields += @('-f', "fonts=$(RemotePath $Fonts)") }
 $mode = if ($Test) { 'transfer-test' } else { 'build' }
 $fields += @('-f', "mode=$mode")
 
 if ($Keys) {
-    Get-Content -LiteralPath $Keys -Raw | gh secret set PROD_KEYS -R $Repo
+    # Values go to gh and rclone as arguments: Windows PowerShell can put a byte-order mark in front of what it pipes
+    gh secret set PROD_KEYS -R $Repo --body (Get-Content -LiteralPath $Keys -Raw)
     if ($LASTEXITCODE) { throw 'could not set the PROD_KEYS secret' }
 } elseif (-not $Test) {
     $names = GhJson secret list -R $Repo --json name | ForEach-Object { $_.name }
     if ($names -notcontains 'PROD_KEYS') { throw 'the PROD_KEYS secret is not set: add -Keys <path to your prod.keys>' }
 }
 
-$parts = Join-Path $root 'ipa-parts'
-New-Item -ItemType Directory -Force -Path $parts | Out-Null
+# The runner's side of the conversation: it leaves <name>.offer.json here and waits for <name>.done or <name>.failed;
+# failed builds leave their logs in logs-run<n>
+$inbox = Join-Path $root 'from-runner'
+New-Item -ItemType Directory -Force -Path $inbox | Out-Null
+$received = @()
 
-# Joins every complete set of parts in ipa-parts (<name>.part-aaa, -aab, ... and <name>.sha256 = "<sha256> <size>") into
-# <name> in the game file's folder, checks its size and SHA-256, then removes the parts.
-function Join-Parts {
-    $joined = @()
-    foreach ($sum in @(Get-ChildItem -LiteralPath $parts -Filter '*.sha256' -File)) {
-        $name = $sum.Name.Substring(0, $sum.Name.Length - '.sha256'.Length)
-        $hash, $size = (Get-Content -LiteralPath $sum.FullName -Raw).Trim() -split '\s+'
-        [string[]] $pieces = @(Get-ChildItem -LiteralPath $parts -Filter "$name.part-*" -File | ForEach-Object { $_.Name })
-        [Array]::Sort($pieces, [StringComparer]::Ordinal)
-        $target = Join-Path $root $name
-        Write-Host "joining $($pieces.Count) parts into $target"
-        $out = [IO.File]::Create($target)
-        try {
-            foreach ($piece in $pieces) {
-                $in = [IO.File]::OpenRead((Join-Path $parts $piece))
-                try { $in.CopyTo($out, 8MB) } finally { $in.Dispose() }
-            }
-        } finally { $out.Dispose() }
-        $actual = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ((Get-Item -LiteralPath $target).Length -ne [long]$size -or $actual -ne $hash) {
-            throw "${name}: the joined file does not match what the runner sent (size or SHA-256); the parts stay in $parts"
+# Downloads each file the runner offers (tunnel address, password, size, SHA-256) into the game file's folder, checks
+# it, and answers with <name>.done, or <name>.failed after three tries
+function Receive-Offers {
+    foreach ($file in @(Get-ChildItem -LiteralPath $inbox -Filter '*.offer.json' -File)) {
+        try { $offer = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json } catch { continue }   # still arriving
+        if (-not $offer.sha256) { continue }
+        $target = Join-Path $root $offer.name
+        $obscured = rclone obscure $offer.pass | Select-Object -Last 1
+        $from = ":webdav,url='$($offer.url)',vendor=other,user=$($offer.user),pass='$obscured':$($offer.name)"
+        $good = $false
+        for ($try = 1; $try -le 3 -and -not $good; $try++) {
+            Write-Host ("downloading {0} ({1:N1} GB), try {2}" -f $offer.name, ($offer.size / 1GB), $try)
+            rclone copyto $from $target --multi-thread-streams 8 --retries 3 --stats 30s --stats-one-line
+            $good = ($LASTEXITCODE -eq 0) -and (Test-Path -LiteralPath $target) -and
+                ((Get-Item -LiteralPath $target).Length -eq [long]$offer.size) -and
+                ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() -eq $offer.sha256)
         }
-        foreach ($piece in $pieces) { Remove-Item -LiteralPath (Join-Path $parts $piece) }
-        Remove-Item -LiteralPath $sum.FullName
-        $joined += $target
+        $answer = if ($good) { '.done' } else { '.failed' }
+        [IO.File]::WriteAllText((Join-Path $inbox ($offer.name + $answer)), '')
+        Remove-Item -LiteralPath $file.FullName
+        if ($good) { $script:received += $target } else { Write-Host "$($offer.name) did not arrive intact" -ForegroundColor Red }
     }
-    $joined
 }
 
 Add-Type -Namespace TotkBuild -Name Power -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint flags);'
@@ -111,7 +111,7 @@ try {
     $bytes = New-Object byte[] 24
     [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $pass = [Convert]::ToBase64String($bytes).Replace('+', 'A').Replace('/', 'B').TrimEnd('=')
-    $obscured = ($pass | rclone obscure -) | Select-Object -Last 1
+    $obscured = rclone obscure $pass | Select-Object -Last 1
     if ($LASTEXITCODE -or -not $obscured) { throw 'rclone obscure failed' }
     $listener = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::Loopback), 0
     $listener.Start(); $port = $listener.LocalEndpoint.Port; $listener.Stop()
@@ -151,7 +151,7 @@ try {
     if (-not $reachable) { throw "the tunnel does not answer; logs: $work" }
 
     $conf = "[pc]`ntype = webdav`nurl = $url`nvendor = other`nuser = totk`npass = $obscured`n"
-    $conf | gh secret set RCLONE_CONF -R $Repo
+    gh secret set RCLONE_CONF -R $Repo --body $conf
     if ($LASTEXITCODE) { throw 'could not set the RCLONE_CONF secret' }
 
     # ---- the run ----
@@ -167,24 +167,29 @@ try {
     if (-not $run) { throw "the workflow started but its run did not show up: https://github.com/$Repo/actions" }
     Write-Host "run: https://github.com/$Repo/actions/runs/$run"
     Write-Host 'Keep this window open and the PC online. Free macOS runners can wait a while in the queue.'
-    gh run watch $run -R $Repo --interval 60 --exit-status
-    $ok = ($LASTEXITCODE -eq 0)
-    $state = GhJson run view $run -R $Repo --json status,conclusion
-    while ($state.status -ne 'completed') {   # gh run watch can return early on a network error
-        Start-Sleep -Seconds 60
-        $state = GhJson run view $run -R $Repo --json status,conclusion
-        $ok = ($state.conclusion -eq 'success')
-    }
 
-    $files = @(Join-Parts)
+    $state = $null; $last = ''
+    do {
+        Start-Sleep -Seconds 20
+        Receive-Offers
+        try { $state = GhJson run view $run -R $Repo --json 'status,conclusion,number,jobs' } catch { continue }   # offline for a moment
+        $step = @($state.jobs | ForEach-Object { $_.steps } | Where-Object { $_.status -eq 'in_progress' } |
+            ForEach-Object { $_.name }) | Select-Object -First 1
+        $now = if ($state.status -ne 'in_progress') { $state.status } elseif ($step) { $step } else { 'starting' }
+        if ($now -ne $last) { Write-Host "$(Get-Date -Format HH:mm)  $now"; $last = $now }
+    } while (-not $state -or $state.status -ne 'completed')
+    Receive-Offers
+    $ok = ($state.conclusion -eq 'success')
+    Get-ChildItem -LiteralPath $inbox -File | Where-Object { $_.Name -like '*.done' -or $_.Name -like '*.failed' } | Remove-Item
+
     if ($Test) {
-        foreach ($f in $files) { Remove-Item -LiteralPath $f }
-        if ($ok -and $files.Count) { Write-Host 'transfer test passed: 200 MB each way (speeds in the run summary)' -ForegroundColor Green }
+        foreach ($f in $received) { Remove-Item -LiteralPath $f }
+        if ($ok -and $received.Count) { Write-Host 'transfer test passed (speeds in the run summary)' -ForegroundColor Green }
         else { throw "transfer test failed: https://github.com/$Repo/actions/runs/$run" }
-    } elseif ($ok -and $files.Count) {
-        foreach ($f in $files) { Write-Host "IPA ready: $f" -ForegroundColor Green }
+    } elseif ($ok -and $received.Count) {
+        foreach ($f in $received) { Write-Host "IPA ready: $f" -ForegroundColor Green }
     } else {
-        $logs = Join-Path $parts "logs-run$((GhJson run view $run -R $Repo --json number).number)"
+        $logs = Join-Path $inbox "logs-run$($state.number)"
         if (Test-Path -LiteralPath $logs) { Write-Host "build logs: $logs" }
         throw "the build failed: https://github.com/$Repo/actions/runs/$run"
     }

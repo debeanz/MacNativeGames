@@ -27,8 +27,8 @@ on:
         type: choice
         options: [build, check, transfer-test]
         default: build
-      split_upload:
-        description: 'Upload in 90 MB parts plus a .sha256 file (for a Cloudflare tunnel, which takes at most 100 MB per upload)'
+      pull:
+        description: 'Let build-from-pc.ps1 download the IPA through a tunnel from the runner, instead of uploading it to output'
         type: boolean
         default: false
       source_ref:
@@ -65,7 +65,7 @@ jobs:
       IN_FONTS: ${{ inputs.fonts }}
       IN_OUTPUT: ${{ inputs.output }}
       MODE: ${{ inputs.mode }}
-      SPLIT_UPLOAD: ${{ inputs.split_upload }}
+      PULL: ${{ inputs.pull }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -96,28 +96,52 @@ jobs:
             printf '%s\n' "$RCLONE_CONF" > "$RUNNER_TEMP/rclone.conf"
             echo "RCLONE_CONFIG=$RUNNER_TEMP/rclone.conf" >> "$GITHUB_ENV"
           fi
-          # send <file> <name>: upload a file to the output folder, in 90 MB parts plus <name>.sha256 when split_upload is
-          # on; the .sha256 file ("<sha256> <size>") goes last, so a complete set always has one
+          # send <file> <name>: put a file in the output folder. With pull on, the output is a PC behind a Cloudflare tunnel,
+          # which takes at most 100 MB and 100 s per upload: the runner serves the file through a tunnel of its own instead,
+          # leaves <name>.offer.json (address, password, SHA-256) in the output folder, and waits until build-from-pc.ps1
+          # has downloaded and checked it and left <name>.done (or <name>.failed) there.
           cat > "$RUNNER_TEMP/send.sh" <<'EOF'
           send() {
-            local dest="${IN_OUTPUT%/}" sum size parts
+            local dest="${IN_OUTPUT%/}" dir="$RUNNER_TEMP/offer" log="$RUNNER_TEMP/offer-tunnel.log" pass url i state
             case "$dest" in *:) ;; *) dest="$dest/" ;; esac
-            local stats=(--stats 1m --stats-one-line --stats-log-level NOTICE)
-            if [ "$SPLIT_UPLOAD" = true ]; then
-              parts="$RUNNER_TEMP/parts/$2"
-              rm -rf "$parts" && mkdir -p "$parts"
-              split -b 90m -a 3 "$1" "$parts/$2.part-"
-              sum=$(shasum -a 256 "$1" | cut -d' ' -f1)
-              size=$(stat -f %z "$1")
-              echo "$(ls "$parts" | wc -l | tr -d ' ') parts of $2"
-              rclone copy "$parts" "$dest" --transfers 4 --retries 5 "${stats[@]}"
-              printf '%s %s\n' "$sum" "$size" > "$RUNNER_TEMP/$2.sha256"
-              rclone copyto "$RUNNER_TEMP/$2.sha256" "$dest$2.sha256" --retries 5
-              rm -rf "$parts"
-            else
-              rclone copyto "$1" "$dest$2" --retries 5 "${stats[@]}"
+            if [ "$PULL" != true ]; then
+              rclone copyto "$1" "$dest$2" --retries 5 --stats 1m --stats-one-line --stats-log-level NOTICE
+              echo "uploaded $dest$2" | tee -a "$GITHUB_STEP_SUMMARY"
+              return
             fi
-            echo "uploaded $dest$2" | tee -a "$GITHUB_STEP_SUMMARY"
+            rm -rf "$dir" && mkdir -p "$dir" && ln "$1" "$dir/$2"
+            pass=$(openssl rand -hex 24)
+            echo "::add-mask::$pass"
+            RCLONE_USER=totk RCLONE_PASS="$pass" rclone serve webdav "$dir" --read-only --addr 127.0.0.1:8090 \
+              > "$RUNNER_TEMP/offer-serve.log" 2>&1 &
+            local serve_pid=$!
+            cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8090 > "$log" 2>&1 &
+            local tunnel_pid=$!
+            for i in $(seq 60); do
+              url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$log" | grep -v '^https://api\.' | head -1 || true)
+              [ -n "$url" ] && break
+              sleep 1
+            done
+            [ -n "$url" ] || { echo "::error::cloudflared gave no tunnel address"; cat "$log"; return 1; }
+            for i in $(seq 40); do   # a new address takes a few seconds to reach DNS
+              curl -fs -o /dev/null -u "totk:$pass" -X PROPFIND -H 'Depth: 0' "$url/" && break
+              sleep 3
+            done
+            printf '{"url":"%s","user":"totk","pass":"%s","name":"%s","sha256":"%s","size":%s}\n' "$url" "$pass" "$2" \
+              "$(shasum -a 256 "$1" | cut -d' ' -f1)" "$(stat -f %z "$1")" > "$RUNNER_TEMP/$2.offer.json"
+            rclone copyto "$RUNNER_TEMP/$2.offer.json" "$dest$2.offer.json" --retries 5
+            echo "offered $2 to the PC; waiting for it to download it"
+            for i in $(seq 360); do   # up to 3 hours
+              state=$(rclone lsf "$dest" --include "$2.done" --include "$2.failed" --retries 3 2>/dev/null | head -1 || true)
+              [ -n "$state" ] && break
+              sleep 30
+            done
+            kill "$serve_pid" "$tunnel_pid" 2>/dev/null || true
+            case "$state" in
+              "$2.done") echo "the PC downloaded and checked $2" | tee -a "$GITHUB_STEP_SUMMARY" ;;
+              "$2.failed") echo "::error::the PC could not download $2 intact"; return 1 ;;
+              *) echo "::error::the PC did not download $2 within 3 hours"; return 1 ;;
+            esac
           }
           EOF
 
@@ -143,11 +167,12 @@ jobs:
 
       - name: Install build tools
         run: |
+          tunnel=$([ "$PULL" = true ] && echo cloudflared || true)
           if [ "$MODE" = transfer-test ]; then
-            brew install rclone
+            brew install rclone $tunnel
             exit 0
           fi
-          brew install opus libvpx python@3.14 xcodegen cmake ninja rclone
+          brew install opus libvpx python@3.14 xcodegen cmake ninja rclone $tunnel
           # Xcode 26 ships the Metal compiler as a separate component; the iOS build compiles its startup shaders with it
           if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
             xcodebuild -downloadComponent MetalToolchain
@@ -200,7 +225,7 @@ jobs:
           start=$(date +%s)
           send "$RUNNER_TEMP/up.bin" "transfer-test-run${GITHUB_RUN_NUMBER}.bin"
           secs=$(( $(date +%s) - start ))
-          echo "uploaded 200 MB in $secs s ($(( 200 / (secs > 0 ? secs : 1) )) MB/s)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "sent 200 MB in $secs s ($(( 200 / (secs > 0 ? secs : 1) )) MB/s)" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Download the game files
         if: inputs.mode == 'build'
