@@ -1,9 +1,10 @@
 # Builds the unsigned iPhone/iPad IPA of Tears of the Kingdom on a GitHub-hosted Mac, from your own game files.
 # Setup and usage: .github/BUILD-IPA.md
 #
-# The game files come from your own storage through rclone (cloud storage, or your PC through .github/pc/build-from-pc.ps1)
-# or a direct https:// link, and the finished IPA goes back there. Nothing from the game is stored on GitHub: no
-# artifacts, and no game data or key values in the log.
+# By default the game files come from the draft release "totk-input", which .github/pc/build-ipa.ps1 fills with
+# encrypted 2000 MB pieces, and the IPA leaves as an encrypted artifact that the same script downloads and decrypts.
+# The password is the FILE_PASS secret, so nobody else can read either one. The game and update inputs can name an
+# rclone path or a direct https:// link instead, and the output input an rclone folder.
 
 name: Build iPhone IPA
 
@@ -11,26 +12,22 @@ on:
   workflow_dispatch:
     inputs:
       game:
-        description: 'Base game 1.0.0, XCI or NSP: rclone path such as "drive:Switch/totk.xci", or a direct https:// link'
+        description: 'Leave empty to use the totk-input draft release. Or the base game 1.0.0 (XCI or NSP) as an rclone path or https:// link'
         required: false
       update:
-        description: 'Update NSP or NSZ (1.4.3 is the version tested on iPhone); leave empty to build 1.0.0'
+        description: 'With game set: the update NSP or NSZ (1.4.3 is the version tested on iPhone); empty builds 1.0.0'
         required: false
       fonts:
-        description: 'NSP base game only: rclone folder of an unpacked firmware (.nca files) or of the six shared-font .bfttf files'
+        description: 'With game set, NSP base only: rclone folder of an unpacked firmware (.nca files) or the six .bfttf fonts'
         required: false
       output:
-        description: 'rclone folder the IPA is uploaded to, such as "drive:Switch/ipa"'
+        description: 'Leave empty for an encrypted artifact. Or an rclone folder the IPA is uploaded to, such as "drive:Switch/ipa"'
         required: false
       mode:
-        description: 'build: make the IPA. check: prepare the Mac and check disk space and inputs. transfer-test: also move 200 MB each way'
+        description: 'build: make the IPA. check: prepare the Mac and check disk space. transfer-test: fetch the inputs and send 200 MB back'
         type: choice
         options: [build, check, transfer-test]
         default: build
-      pull:
-        description: 'Let build-from-pc.ps1 download the IPA through a tunnel from the runner, instead of uploading it to output'
-        type: boolean
-        default: false
       source_ref:
         description: 'Branch, tag or commit of ly05010419/MacNativeGames to build'
         required: false
@@ -42,7 +39,7 @@ on:
         default: macos-26
 
 permissions:
-  contents: read
+  contents: write   # reading and deleting a draft release needs write access
 
 concurrency:
   group: build-ipa
@@ -59,13 +56,15 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
       HOMEBREW_NO_ENV_HINTS: '1'
+      GH_TOKEN: ${{ github.token }}
+      RELEASE: totk-input
+      ITER: '100000'   # PBKDF2 rounds; build-ipa.ps1 uses the same
       # Inputs reach the scripts as environment variables, never pasted into them
       IN_GAME: ${{ inputs.game }}
       IN_UPDATE: ${{ inputs.update }}
       IN_FONTS: ${{ inputs.fonts }}
       IN_OUTPUT: ${{ inputs.output }}
       MODE: ${{ inputs.mode }}
-      PULL: ${{ inputs.pull }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -78,15 +77,19 @@ jobs:
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
           PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          FILE_PASS: ${{ secrets.FILE_PASS }}
         run: |
           echo "TOTK=$HOME/totk" >> "$GITHUB_ENV"
           remote() { [ -n "$1" ] && case "$1" in http://*|https://*) false ;; *) true ;; esac; }
-          if [ "$MODE" != check ]; then
-            [ -n "$IN_GAME" ] || { echo "::error::the game input is empty"; exit 1; }
-            [ -n "$IN_OUTPUT" ] || { echo "::error::the output input is empty"; exit 1; }
-          fi
           if [ "$MODE" = build ]; then
-            [ -n "$PROD_KEYS" ] || { echo "::error::the PROD_KEYS secret is not set (Settings > Secrets and variables > Actions)"; exit 1; }
+            [ -n "$PROD_KEYS" ] || { echo "::error::the PROD_KEYS secret is not set (build-ipa.ps1 -Keys sets it)"; exit 1; }
+          fi
+          if [ -z "$IN_GAME" ] || [ -z "$IN_OUTPUT" ]; then
+            [ -n "$FILE_PASS" ] || { echo "::error::the FILE_PASS secret is not set (build-ipa.ps1 sets it)"; exit 1; }
+          fi
+          if [ -z "$IN_GAME" ] && [ "$MODE" != check ]; then
+            gh release view "$RELEASE" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -qx manifest.json ||
+              { echo "::error::the $RELEASE draft release has no manifest.json yet: upload the game files with build-ipa.ps1"; exit 1; }
           fi
           if remote "$IN_GAME" || remote "$IN_UPDATE" || remote "$IN_FONTS" || remote "$IN_OUTPUT"; then
             [ -n "$RCLONE_CONF" ] || { echo "::error::an rclone path is used but the RCLONE_CONF secret is not set"; exit 1; }
@@ -96,54 +99,6 @@ jobs:
             printf '%s\n' "$RCLONE_CONF" > "$RUNNER_TEMP/rclone.conf"
             echo "RCLONE_CONFIG=$RUNNER_TEMP/rclone.conf" >> "$GITHUB_ENV"
           fi
-          # send <file> <name>: put a file in the output folder. With pull on, the output is a PC behind a Cloudflare tunnel,
-          # which takes at most 100 MB and 100 s per upload: the runner serves the file through a tunnel of its own instead,
-          # leaves <name>.offer.json (address, password, SHA-256) in the output folder, and waits until build-from-pc.ps1
-          # has downloaded and checked it and left <name>.done (or <name>.failed) there.
-          cat > "$RUNNER_TEMP/send.sh" <<'EOF'
-          send() {
-            local dest="${IN_OUTPUT%/}" dir="$RUNNER_TEMP/offer" log="$RUNNER_TEMP/offer-tunnel.log" pass url i state
-            case "$dest" in *:) ;; *) dest="$dest/" ;; esac
-            if [ "$PULL" != true ]; then
-              rclone copyto "$1" "$dest$2" --retries 5 --stats 1m --stats-one-line --stats-log-level NOTICE
-              echo "uploaded $dest$2" | tee -a "$GITHUB_STEP_SUMMARY"
-              return
-            fi
-            rm -rf "$dir" && mkdir -p "$dir" && ln "$1" "$dir/$2"
-            pass=$(openssl rand -hex 24)
-            echo "::add-mask::$pass"
-            RCLONE_USER=totk RCLONE_PASS="$pass" rclone serve webdav "$dir" --read-only --addr 127.0.0.1:8090 \
-              > "$RUNNER_TEMP/offer-serve.log" 2>&1 &
-            local serve_pid=$!
-            cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8090 > "$log" 2>&1 &
-            local tunnel_pid=$!
-            for i in $(seq 60); do
-              url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$log" | grep -v '^https://api\.' | head -1 || true)
-              [ -n "$url" ] && break
-              sleep 1
-            done
-            [ -n "$url" ] || { echo "::error::cloudflared gave no tunnel address"; cat "$log"; return 1; }
-            for i in $(seq 40); do   # a new address takes a few seconds to reach DNS
-              curl -fs -o /dev/null -u "totk:$pass" -X PROPFIND -H 'Depth: 0' "$url/" && break
-              sleep 3
-            done
-            printf '{"url":"%s","user":"totk","pass":"%s","name":"%s","sha256":"%s","size":%s}\n' "$url" "$pass" "$2" \
-              "$(shasum -a 256 "$1" | cut -d' ' -f1)" "$(stat -f %z "$1")" > "$RUNNER_TEMP/$2.offer.json"
-            rclone copyto "$RUNNER_TEMP/$2.offer.json" "$dest$2.offer.json" --retries 5
-            echo "offered $2 to the PC; waiting for it to download it"
-            for i in $(seq 360); do   # up to 3 hours
-              state=$(rclone lsf "$dest" --include "$2.done" --include "$2.failed" --retries 3 2>/dev/null | head -1 || true)
-              [ -n "$state" ] && break
-              sleep 30
-            done
-            kill "$serve_pid" "$tunnel_pid" 2>/dev/null || true
-            case "$state" in
-              "$2.done") echo "the PC downloaded and checked $2" | tee -a "$GITHUB_STEP_SUMMARY" ;;
-              "$2.failed") echo "::error::the PC could not download $2 intact"; return 1 ;;
-              *) echo "::error::the PC did not download $2 within 3 hours"; return 1 ;;
-            esac
-          }
-          EOF
 
       - name: Free disk space
         if: inputs.mode != 'transfer-test'
@@ -167,19 +122,19 @@ jobs:
 
       - name: Install build tools
         run: |
-          tunnel=$([ "$PULL" = true ] && echo cloudflared || true)
           if [ "$MODE" = transfer-test ]; then
-            brew install rclone $tunnel
-            exit 0
+            brew install openssl@3 rclone
+          else
+            brew install opus libvpx python@3.14 xcodegen cmake ninja openssl@3 rclone
+            # Xcode 26 ships the Metal compiler as a separate component; the iOS build compiles its startup shaders with it
+            if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+              xcodebuild -downloadComponent MetalToolchain
+            fi
+            xcrun -sdk iphoneos metal --version | head -1
+            xcrun --sdk iphoneos --show-sdk-version
+            python3.14 --version
           fi
-          brew install opus libvpx python@3.14 xcodegen cmake ninja rclone $tunnel
-          # Xcode 26 ships the Metal compiler as a separate component; the iOS build compiles its startup shaders with it
-          if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
-            xcodebuild -downloadComponent MetalToolchain
-          fi
-          xcrun -sdk iphoneos metal --version | head -1
-          xcrun --sdk iphoneos --show-sdk-version
-          python3.14 --version
+          echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
 
       - name: Check disk space for the build
         run: |
@@ -187,72 +142,88 @@ jobs:
             case "$1" in
               '') echo 0 ;;
               http://*|https://*) b=$(curl -fsSLI "$1" | tr -d '\r' | awk 'tolower($1)=="content-length:"{n=$2} END{print n+0}'); echo $(( (b + 2**30 - 1) / 2**30 )) ;;
-              *) b=$(rclone size --json "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])'); echo $(( (b + 2**30 - 1) / 2**30 )) ;;
+              *) b=$(rclone size --json "$1" | jq .bytes); echo $(( (b + 2**30 - 1) / 2**30 )) ;;
             esac
           }
           inputs=0
-          for src in "$IN_GAME" "$IN_UPDATE" "$IN_FONTS"; do
-            [ -n "$src" ] || continue
-            gb=$(size_gb "$src")
-            echo "input $src: $gb GB"
-            inputs=$((inputs + gb))
-          done
-          [ -n "$IN_GAME" ] || { inputs=25; echo "no game input given: assuming 25 GB of inputs"; }
-          # build_app.py asks for 60 GB free beside a fresh base + update build (45 GB without an update)
-          build=$([ -n "$IN_UPDATE" ] || [ -z "$IN_GAME" ] && echo 60 || echo 45)
+          if [ -n "$IN_GAME" ]; then
+            for src in "$IN_GAME" "$IN_UPDATE" "$IN_FONTS"; do
+              [ -n "$src" ] || continue
+              gb=$(size_gb "$src")
+              echo "input $src: $gb GB"
+              inputs=$((inputs + gb))
+            done
+            update=$IN_UPDATE
+          elif [ "$MODE" != check ]; then
+            gh release download "$RELEASE" -R "$GITHUB_REPOSITORY" -p manifest.json -O "$RUNNER_TEMP/manifest.json" --clobber
+            jq -r '.files[] | "input \(.role): \(.name), \(.size) bytes in \(.pieces | length) pieces"' "$RUNNER_TEMP/manifest.json"
+            b=$(jq '[.files[].size] | add' "$RUNNER_TEMP/manifest.json")
+            inputs=$(( (b + 2**30 - 1) / 2**30 ))
+            update=$(jq -r '.files[] | select(.role == "update") | .name' "$RUNNER_TEMP/manifest.json")
+          else
+            inputs=25; update=yes
+            echo "no inputs looked at: assuming 25 GB of them, with an update"
+          fi
+          # build_app.py asks for 60 GB free beside a fresh base + update build (45 GB without an update); the encrypted
+          # IPA needs about 18 GB more, and a release piece 2 GB while it is decrypted
+          build=$([ -n "$update" ] && echo 60 || echo 45)
           free=$(df -g "$HOME" | awk 'NR==2{print $4}')
-          need=$((inputs + build + 2))
-          echo "free: $free GB, needed: about $need GB ($inputs GB of inputs + $build GB for the build)"
+          need=$((inputs + build + 20))
+          echo "free: $free GB, needed: about $need GB ($inputs GB of inputs, $build GB for the build, 20 GB for the IPA's copy)"
           if [ "$MODE" != transfer-test ] && [ "$free" -lt "$need" ]; then
             echo "::error::not enough disk space on this runner ($free GB free, about $need GB needed); try the macos-26-xlarge runner"
             exit 1
           fi
 
-      - name: Test the transfer both ways
-        if: inputs.mode == 'transfer-test'
-        run: |
-          . "$RUNNER_TEMP/send.sh"
-          case "$IN_GAME" in
-            http://*|https://*) get=(curl -fsSL -r 0-209715199 "$IN_GAME") ;;
-            *) get=(rclone cat --count 209715200 "$IN_GAME") ;;
-          esac
-          start=$(date +%s)
-          "${get[@]}" > "$RUNNER_TEMP/down.bin"
-          secs=$(( $(date +%s) - start ))
-          mb=$(( $(stat -f %z "$RUNNER_TEMP/down.bin") / 1048576 ))
-          echo "downloaded $mb MB of the game file in $secs s ($(( mb / (secs > 0 ? secs : 1) )) MB/s)" | tee -a "$GITHUB_STEP_SUMMARY"
-          head -c 209715200 /dev/urandom > "$RUNNER_TEMP/up.bin"
-          start=$(date +%s)
-          send "$RUNNER_TEMP/up.bin" "transfer-test-run${GITHUB_RUN_NUMBER}.bin"
-          secs=$(( $(date +%s) - start ))
-          echo "sent 200 MB in $secs s ($(( 200 / (secs > 0 ? secs : 1) )) MB/s)" | tee -a "$GITHUB_STEP_SUMMARY"
-
       - name: Download the game files
-        if: inputs.mode == 'build'
+        if: inputs.mode != 'check'
+        env:
+          FILE_PASS: ${{ secrets.FILE_PASS }}
         run: |
           mkdir -p "$TOTK/in" "$TOTK/fonts" "$TOTK/out"
-          fetch() {   # fetch <source> <folder>: prints the downloaded file's path
-            local name
-            case "$1" in
-              http://*|https://*)
-                name="${1%%\?*}"; name="${name##*/}"
-                curl -fL --retry 5 --no-progress-meter -o "$2/${name:-download}" "$1" >&2
-                ;;
-              *)
-                name="${1##*/}"; name="${name#*:}"
-                rclone copy "$1" "$2" --multi-thread-streams 8 --retries 5 --stats 1m --stats-one-line --stats-log-level NOTICE >&2
-                ;;
-            esac
-            echo "$2/$name"
-          }
-          game=$(fetch "$IN_GAME" "$TOTK/in")
-          echo "GAME_FILE=$game" >> "$GITHUB_ENV"
-          if [ -n "$IN_UPDATE" ]; then
-            update=$(fetch "$IN_UPDATE" "$TOTK/in")
-            echo "UPDATE_FILE=$update" >> "$GITHUB_ENV"
-          fi
-          if [ -n "$IN_FONTS" ]; then
-            rclone copy "$IN_FONTS" "$TOTK/fonts" --retries 5 --stats 1m --stats-one-line --stats-log-level NOTICE
+          stats=(--stats 1m --stats-one-line --stats-log-level NOTICE)
+          if [ -z "$IN_GAME" ]; then
+            # Each piece is "openssl enc -aes-256-cbc -pbkdf2 -md sha256" output of up to 2000 MB of the file; decrypting
+            # them in order and appending gives the file back, checked against its SHA-256 from the manifest
+            m="$RUNNER_TEMP/manifest.json"
+            gh release download "$RELEASE" -R "$GITHUB_REPOSITORY" -p manifest.json -O "$m" --clobber
+            for i in $(seq 0 $(( $(jq '.files | length' "$m") - 1 ))); do
+              role=$(jq -r ".files[$i].role" "$m"); name=$(jq -r ".files[$i].name" "$m")
+              case "$role" in game|update) out="$TOTK/in/$name" ;; *) out="$RUNNER_TEMP/$name" ;; esac
+              : > "$out"
+              for piece in $(jq -r ".files[$i].pieces[]" "$m"); do
+                gh release download "$RELEASE" -R "$GITHUB_REPOSITORY" -p "$piece" -D "$RUNNER_TEMP/pieces" --clobber
+                "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter "$ITER" -md sha256 -pass env:FILE_PASS \
+                  -in "$RUNNER_TEMP/pieces/$piece" >> "$out"
+                rm "$RUNNER_TEMP/pieces/$piece"
+              done
+              [ "$(shasum -a 256 "$out" | cut -d' ' -f1)" = "$(jq -r ".files[$i].sha256" "$m")" ] ||
+                { echo "::error::$name does not match its SHA-256 after decrypting"; exit 1; }
+              echo "$role: $name ($(stat -f %z "$out") bytes, SHA-256 checked)"
+              case "$role" in
+                game) echo "GAME_FILE=$out" >> "$GITHUB_ENV" ;;
+                update) echo "UPDATE_FILE=$out" >> "$GITHUB_ENV" ;;
+                fonts) ditto -x -k "$out" "$TOTK/fonts" && rm "$out" ;;
+              esac
+            done
+          else
+            fetch() {   # fetch <source> <folder>: prints the downloaded file's path
+              local name
+              case "$1" in
+                http://*|https://*)
+                  name="${1%%\?*}"; name="${name##*/}"
+                  curl -fL --retry 5 --no-progress-meter -o "$2/${name:-download}" "$1" >&2
+                  ;;
+                *)
+                  name="${1##*/}"; name="${name#*:}"
+                  rclone copy "$1" "$2" --multi-thread-streams 8 --retries 5 "${stats[@]}" >&2
+                  ;;
+              esac
+              echo "$2/$name"
+            }
+            echo "GAME_FILE=$(fetch "$IN_GAME" "$TOTK/in")" >> "$GITHUB_ENV"
+            [ -z "$IN_UPDATE" ] || echo "UPDATE_FILE=$(fetch "$IN_UPDATE" "$TOTK/in")" >> "$GITHUB_ENV"
+            [ -z "$IN_FONTS" ] || rclone copy "$IN_FONTS" "$TOTK/fonts" --retries 5 "${stats[@]}"
           fi
           ls -l "$TOTK/in" "$TOTK/fonts"
           df -h /System/Volumes/Data
@@ -276,21 +247,82 @@ jobs:
           fi
           python3.14 -u build_app.py "${args[@]}"
           ls -l "$TOTK/out"
-          shasum -a 256 "$TOTK/out/TOTK.ipa"
 
-      - name: Upload the IPA
-        if: inputs.mode == 'build'
+      - name: Make a 200 MB stand-in for the IPA
+        if: inputs.mode == 'transfer-test'
+        run: head -c 209715200 /dev/urandom > "$TOTK/out/TOTK.ipa"
+
+      - name: Prepare the IPA for sending
+        if: inputs.mode != 'check'
+        env:
+          FILE_PASS: ${{ secrets.FILE_PASS }}
         run: |
-          . "$RUNNER_TEMP/send.sh"
-          send "$TOTK/out/TOTK.ipa" "TOTK-$(date -u +%Y%m%d)-run${GITHUB_RUN_NUMBER}.ipa"
+          name="TOTK-$(date -u +%Y%m%d)-run${GITHUB_RUN_NUMBER}$([ "$MODE" = build ] || echo -test).ipa"
+          echo "IPA_NAME=$name" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/send"
+          shasum -a 256 "$TOTK/out/TOTK.ipa" | cut -d' ' -f1 > "$RUNNER_TEMP/send/$name.sha256"
+          if [ -z "$IN_OUTPUT" ]; then
+            "$OPENSSL" enc -aes-256-cbc -pbkdf2 -iter "$ITER" -md sha256 -pass env:FILE_PASS \
+              -in "$TOTK/out/TOTK.ipa" -out "$RUNNER_TEMP/send/$name.enc"
+            rm "$TOTK/out/TOTK.ipa"
+          else
+            dest="${IN_OUTPUT%/}"
+            case "$dest" in *:) ;; *) dest="$dest/" ;; esac
+            rclone copyto "$TOTK/out/TOTK.ipa" "$dest$name" --retries 5 --stats 1m --stats-one-line --stats-log-level NOTICE
+            echo "uploaded $dest$name" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          ls -l "$RUNNER_TEMP/send"
 
-      # Build logs may hold what hactool prints about the encrypted game files, so they go to your own storage, not GitHub
-      - name: Upload build logs to your storage
-        if: failure() && inputs.mode == 'build' && inputs.output != '' && env.RCLONE_CONFIG != ''
+      # Encrypted with FILE_PASS: only build-ipa.ps1 -Receive (with your password) turns it back into the IPA
+      - name: Upload the encrypted IPA
+        if: inputs.mode != 'check' && inputs.output == ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ runner.temp }}/send/${{ env.IPA_NAME }}.enc
+          archive: false
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload its SHA-256
+        if: inputs.mode != 'check' && inputs.output == ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ runner.temp }}/send/${{ env.IPA_NAME }}.sha256
+          archive: false
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Summary
+        if: inputs.mode != 'check' && inputs.output == ''
+        run: |
+          echo "The encrypted IPA is ready: on your PC, run build-ipa.ps1 -Receive to download and decrypt it." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Build logs may hold what hactool prints about the encrypted game files, so they never go to GitHub as they are:
+      # to your storage with an output folder, otherwise encrypted like the IPA
+      - name: Collect the build logs
+        if: failure() && inputs.mode == 'build'
+        env:
+          FILE_PASS: ${{ secrets.FILE_PASS }}
         run: |
           [ -d "$TOTK/TOTK_build/logs" ] || exit 0
-          dest="${IN_OUTPUT%/}"
-          case "$dest" in *:) ;; *) dest="$dest/" ;; esac
-          rclone copy "$TOTK/TOTK_build/logs" "${dest}logs-run${GITHUB_RUN_NUMBER}" --retries 5
-          echo "build logs: ${dest}logs-run${GITHUB_RUN_NUMBER}" | tee -a "$GITHUB_STEP_SUMMARY"
           df -h /System/Volumes/Data
+          name="TOTK-logs-run${GITHUB_RUN_NUMBER}.tar.gz"
+          tar -czf "$RUNNER_TEMP/$name" -C "$TOTK/TOTK_build" logs
+          if [ -n "$IN_OUTPUT" ] && [ -n "${RCLONE_CONFIG:-}" ]; then
+            dest="${IN_OUTPUT%/}"
+            case "$dest" in *:) ;; *) dest="$dest/" ;; esac
+            rclone copyto "$RUNNER_TEMP/$name" "$dest$name" --retries 5
+            echo "build logs: $dest$name" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            "$OPENSSL" enc -aes-256-cbc -pbkdf2 -iter "$ITER" -md sha256 -pass env:FILE_PASS \
+              -in "$RUNNER_TEMP/$name" -out "$RUNNER_TEMP/$name.enc"
+            echo "LOGS_FILE=$RUNNER_TEMP/$name.enc" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload the encrypted build logs
+        if: failure() && inputs.mode == 'build' && env.LOGS_FILE != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ env.LOGS_FILE }}
+          archive: false
+          retention-days: 7

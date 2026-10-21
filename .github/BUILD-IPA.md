@@ -4,98 +4,55 @@
 Xcode 26), so no Mac of your own is needed. It builds from the latest `ly05010419/MacNativeGames` code, not this fork's
 copy, so the fork never needs syncing.
 
-The runner downloads your game files with [rclone](https://rclone.org), builds, and sends the IPA back. Nothing from the
-game is stored on GitHub: no artifacts, and the log shows file names and sizes only. This repository is public, so its
-logs are public too. The files can come from:
+`.github/pc/build-ipa.ps1` does the rest from a Windows PC:
 
-- **your PC** (free, no cloud account): see [Build straight from your PC](#build-straight-from-your-pc);
-- **cloud storage** rclone supports, with room for the game files plus a ~17 GB IPA: see [Build from cloud storage](#build-from-cloud-storage);
-- a direct `https://` link.
+1. It encrypts your game files with a password of your own (AES-256) and uploads them in 2000 MB pieces to a **draft**
+   release of this fork. Only accounts with write access to the repository can see a draft release, and without the
+   password the pieces are unreadable.
+2. It starts the workflow. The PC can be switched off while the run builds (one to several hours; free macOS runners
+   can also wait a while in the queue first).
+3. It downloads the IPA, which the run leaves as an encrypted artifact, decrypts it, checks its SHA-256, and deletes the
+   game files and the artifact from GitHub.
+
+The password is made on first use and kept in `%LOCALAPPDATA%\TOTK-IPA\password.txt` and in the `FILE_PASS` secret.
+This repository is public, so its run logs are too; they show file names and sizes, never the files or the keys.
 
 ## What you need
 
 - Your own **Tears of the Kingdom 1.0.0** XCI or NSP, the **1.4.3 update** NSP/NSZ (the version tested on iPhone), and
   your **prod.keys**, all from your own Switch.
 - For an NSP base game: an unpacked **firmware** folder of `.nca` files, or the six shared-font `.bfttf` files.
+- The GitHub CLI, signed in: `winget install GitHub.cli`, then `gh auth login`.
+- Free disk space for about twice the IPA (~35 GB) when it comes back: the encrypted download and the decrypted IPA.
 
-## Build straight from your PC
+## Build
 
-`.github/pc/build-from-pc.ps1` shares the game file's folder through a temporary, password-protected Cloudflare quick
-tunnel (no Cloudflare account) and starts the workflow; when the IPA is built, the runner opens a tunnel of its own and the script downloads the IPA through it and checks it. Your
-PC must stay on and online until it says the IPA is ready; it keeps Windows from sleeping meanwhile. The runner pulls
-16-20 GB at your upload speed (about 2 hours at 20 Mbit/s); the ~17 GB IPA comes back at your download speed.
+In PowerShell, in the folder that holds `build-ipa.ps1`:
 
-1. Once: install the tools and sign in to GitHub.
+```
+powershell -ExecutionPolicy Bypass -File build-ipa.ps1 -Game D:\Switch\totk.xci -Update D:\Switch\totk-1.4.3.nsp -Keys D:\Switch\prod.keys
+```
 
-   ```
-   winget install Rclone.Rclone
-   winget install Cloudflare.cloudflared
-   winget install GitHub.cli
-   gh auth login
-   ```
+For an NSP base game add `-Fonts D:\Switch\firmware`. `-Keys` stores your prod.keys as the encrypted `PROD_KEYS`
+secret; later runs can leave it out. If the upload stops, run the same command again: pieces already uploaded are
+skipped.
 
-2. Put the update (and for an NSP, the firmware folder) in the game file's folder or a folder inside it.
+Leave the window open and the IPA lands in your Downloads folder when the run is done. Or close it, and afterwards:
 
-3. Optional: check the tunnel both ways in a few minutes (200 MB each way, speeds in the run summary):
+```
+powershell -ExecutionPolicy Bypass -File build-ipa.ps1 -Receive
+```
 
-   ```
-   powershell -ExecutionPolicy Bypass -File .github\pc\build-from-pc.ps1 -Game D:\Switch\totk.xci -Test
-   ```
+`-OutDir <folder>` puts the IPA somewhere else; `-KeepInputs` keeps the uploaded game files for another build. If a
+build fails, its logs are in an encrypted artifact of the run, and the game files stay uploaded for the next try.
 
-4. Build. `-Keys` stores your prod.keys as the encrypted `PROD_KEYS` secret (needed once):
+`-Test` instead checks the whole path in a few minutes without building: the game files go up and are decrypted and
+checked on the runner, and a 200 MB stand-in for the IPA comes back.
 
-   ```
-   powershell -ExecutionPolicy Bypass -File .github\pc\build-from-pc.ps1 -Game D:\Switch\totk.xci -Update D:\Switch\totk-1.4.3.nsp -Keys D:\Switch\prod.keys
-   ```
+## Other sources
 
-   For an NSP base game add `-Fonts D:\Switch\firmware`. The IPA appears next to the game file as
-   `TOTK-<date>-run<n>.ipa`; if the build fails, its logs are in `from-runner\logs-run<n>` there.
-
-## Build from cloud storage
-
-1. Install rclone and add your storage as a remote. The examples below call it `drive`:
-
-   ```
-   winget install Rclone.Rclone
-   rclone config
-   ```
-
-   For Google Drive, the `drive.file` scope limits rclone to files it uploaded itself, which is safer for a token
-   stored on GitHub (`rclone config create drive drive scope=drive.file`). Then upload the game files with rclone:
-
-   ```
-   rclone copy D:\Switch\totk.xci drive:Switch -P
-   rclone copy D:\Switch\totk-1.4.3.nsp drive:Switch -P
-   ```
-
-2. Add two repository secrets (Settings > Secrets and variables > Actions > New repository secret), or with the
-   GitHub CLI in PowerShell:
-
-   ```
-   gh secret set PROD_KEYS -R debeanz/MacNativeGames --body (Get-Content D:\Switch\prod.keys -Raw)
-   gh secret set RCLONE_CONF -R debeanz/MacNativeGames --body (Get-Content (rclone config file | Select-Object -Last 1) -Raw)
-   ```
-
-3. Actions tab > **Build iPhone IPA** > **Run workflow**, then fill in:
-
-   | Input | Example |
-   |---|---|
-   | game | `drive:Switch/totk.xci` |
-   | update | `drive:Switch/totk-1.4.3.nsp` |
-   | fonts | NSP base only: `drive:Switch/firmware` |
-   | output | `drive:Switch/ipa` |
-
-   Or from the command line:
-
-   ```
-   gh workflow run build-ipa.yml -R debeanz/MacNativeGames -f game=drive:Switch/totk.xci -f update=drive:Switch/totk-1.4.3.nsp -f output=drive:Switch/ipa
-   ```
-
-   The **check** mode shows in a few minutes whether the runner has enough disk space and can see your files. The IPA
-   lands in the output folder as `TOTK-<date>-run<n>.ipa`; if the build fails, its logs go to `logs-run<n>` there.
-
-A fresh build takes one to several hours on the free runner (6-hour limit), and free macOS runners can wait a while in
-the queue first.
+The workflow's `game`, `update`, `fonts` and `output` inputs also take [rclone](https://rclone.org) paths (with the
+remote's config in the `RCLONE_CONF` secret) or direct `https://` links, for game files on your own cloud storage.
 
 ## Install
 
