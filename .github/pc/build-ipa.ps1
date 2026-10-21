@@ -52,7 +52,7 @@ $passFile = Join-Path $store 'password.txt'
 if (Test-Path -LiteralPath $passFile) {
     $pass = (Get-Content -LiteralPath $passFile -Raw).Trim()
 } elseif ($Receive) {
-    throw "no password in $passFile: the IPA can only be decrypted on the PC that uploaded the game files"
+    throw "no password in ${passFile}: the IPA can only be decrypted on the PC that uploaded the game files"
 } else {
     New-Item -ItemType Directory -Force -Path $store | Out-Null
     $bytes = New-Object byte[] 30
@@ -153,9 +153,9 @@ function Send-Inputs {
     }
 
     $existing = @{}
-    $release = GhJson api "repos/$Repo/releases?per_page=100" | Where-Object { $_.tag_name -eq $Release } | Select-Object -First 1
-    if ($release) {
-        foreach ($asset in $release.assets) { $existing[$asset.name] = [long]$asset.size }
+    $draft = GhJson api "repos/$Repo/releases?per_page=100" | Where-Object { $_.tag_name -eq $Release } | Select-Object -First 1
+    if ($draft) {
+        foreach ($asset in $draft.assets) { $existing[$asset.name] = [long]$asset.size }
     } else {
         gh release create $Release -R $Repo --draft --title 'TOTK input (encrypted)' --notes 'Encrypted game files for the Build iPhone IPA workflow. Made by .github/pc/build-ipa.ps1; deleted once the IPA is back.'
         if ($LASTEXITCODE) { throw 'could not create the draft release' }
