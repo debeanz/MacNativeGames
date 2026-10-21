@@ -143,7 +143,7 @@ function Hex([byte[]] $bytes) { -join ($bytes | ForEach-Object { $_.ToString('x2
 function Send-Inputs {
     $files = @(@{ role = 'game'; path = $Game })
     if ($Update) { $files += @{ role = 'update'; path = $Update } }
-    $tempDir = Join-Path $store 'upload'
+    $tempDir = Join-Path (Split-Path -Parent $Game) 'totk-ipa-upload'   # on the game's drive: a piece takes 2 GB
     New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
     if ($Fonts) {   # the firmware or font folder travels as one zip
         $zip = Join-Path $tempDir 'fonts.zip'
@@ -251,12 +251,20 @@ if ($LASTEXITCODE) { throw 'could not set the FILE_PASS secret' }
 if ($Keys) {
     gh secret set PROD_KEYS -R $Repo --body (Get-Content -LiteralPath $Keys -Raw)
     if ($LASTEXITCODE) { throw 'could not set the PROD_KEYS secret' }
-} elseif (-not $Test) {
-    $names = GhJson secret list -R $Repo --json name | ForEach-Object { $_.name }
-    if ($names -notcontains 'PROD_KEYS') { throw 'the PROD_KEYS secret is not set: add -Keys <path to your prod.keys>' }
 }
 
 Send-Inputs
+
+# Without -Keys, the PROD_KEYS secret may still be on its way: the upload does not need it, the build does
+for ($asked = $false; -not $Test; $asked = $true) {
+    $names = GhJson secret list -R $Repo --json name | ForEach-Object { $_.name }
+    if ($names -contains 'PROD_KEYS') { break }
+    if (-not $asked) {
+        Write-Host "Waiting for the PROD_KEYS secret before starting the build. Set it with:" -ForegroundColor Yellow
+        Write-Host "  gh secret set PROD_KEYS -R $Repo --body (Get-Content <path to your prod.keys> -Raw)"
+    }
+    Start-Sleep -Seconds 30
+}
 
 $mode = if ($Test) { 'transfer-test' } else { 'build' }
 $before = @(GhJson run list -R $Repo --workflow build-ipa.yml -L 20 --json databaseId | ForEach-Object { $_.databaseId })
