@@ -104,7 +104,8 @@ jobs:
         if: inputs.mode != 'transfer-test'
         run: |
           df -h /System/Volumes/Data
-          # Keep only the selected Xcode; the others, the simulators and unused SDKs take most of the disk
+          # Keep only the selected Xcode; the others and unused SDKs take most of the disk. The simulator runtimes stay:
+          # Xcode 26 reports the iOS platform as not installed without them, and then cannot build for a device.
           keep="$(cd "$(xcode-select -p)/../.." && pwd -P)"
           echo "keeping $keep ($(xcodebuild -version | head -1))"
           for x in /Applications/Xcode*.app; do
@@ -112,10 +113,7 @@ jobs:
             [ "$(cd "$x" && pwd -P)" = "$keep" ] && continue
             sudo rm -rf "$x" &
           done
-          xcrun simctl shutdown all >/dev/null 2>&1 || true
-          xcrun simctl delete all >/dev/null 2>&1 || true
-          xcrun simctl runtime delete all </dev/null >/dev/null 2>&1 || true
-          sudo rm -rf ~/Library/Developer/CoreSimulator ~/Library/Android "${ANDROID_HOME:-/nonexistent}" ~/.dotnet \
+          sudo rm -rf ~/Library/Android "${ANDROID_HOME:-/nonexistent}" ~/.dotnet \
             /usr/local/share/dotnet ~/.ghcup ~/.rustup ~/.cargo "${RUNNER_TOOL_CACHE:-/nonexistent}" &
           wait
           df -h /System/Volumes/Data
@@ -132,6 +130,13 @@ jobs:
             fi
             xcrun -sdk iphoneos metal --version | head -1
             xcrun --sdk iphoneos --show-sdk-version
+            # Building for "Any iOS Device" needs Xcode's iOS platform component; fetch it if this image lacks it
+            sdk=$(xcrun --sdk iphoneos --show-sdk-version)
+            if ! xcrun simctl runtime list 2>/dev/null | grep -q "iOS $sdk"; then
+              echo "no iOS $sdk platform installed: downloading it"
+              xcodebuild -downloadPlatform iOS || echo "::warning::could not download the iOS platform"
+            fi
+            xcrun simctl runtime list 2>/dev/null | grep -i "ios" | head -3 || true
             python3.14 --version
           fi
           echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
