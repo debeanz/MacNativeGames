@@ -191,12 +191,12 @@ jobs:
               role=$(jq -r ".files[$i].role" "$m"); name=$(jq -r ".files[$i].name" "$m")
               case "$role" in game|update) out="$TOTK/in/$name" ;; *) out="$RUNNER_TEMP/$name" ;; esac
               : > "$out"
-              for piece in $(jq -r ".files[$i].pieces[]" "$m"); do
+              while IFS= read -r piece; do
                 gh release download "$RELEASE" -R "$GITHUB_REPOSITORY" -p "$piece" -D "$RUNNER_TEMP/pieces" --clobber
                 "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter "$ITER" -md sha256 -pass env:FILE_PASS \
                   -in "$RUNNER_TEMP/pieces/$piece" >> "$out"
                 rm "$RUNNER_TEMP/pieces/$piece"
-              done
+              done < <(jq -r ".files[$i].pieces[]" "$m")
               [ "$(shasum -a 256 "$out" | cut -d' ' -f1)" = "$(jq -r ".files[$i].sha256" "$m")" ] ||
                 { echo "::error::$name does not match its SHA-256 after decrypting"; exit 1; }
               echo "$role: $name ($(stat -f %z "$out") bytes, SHA-256 checked)"

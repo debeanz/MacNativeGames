@@ -171,7 +171,8 @@ function Send-Inputs {
         $source = [IO.File]::OpenRead($item.FullName)
         try {
             for ($i = 0; $i -lt $count; $i++) {
-                $name = '{0}.{1:d3}.enc' -f $item.Name, $i
+                # GitHub turns spaces and other special characters of an asset's name into dots; name it that way already
+                $name = '{0}.{1:d3}.enc' -f ($item.Name -replace '[^A-Za-z0-9._-]', '.'), $i
                 $length = [Math]::Min([long]$PieceSize, $item.Length - $i * [long]$PieceSize)
                 # AES-CBC with PKCS7: 16 bytes of header plus the length rounded up to the next 16 bytes
                 $encrypted = 16 + ([Math]::Floor($length / 16) + 1) * 16
